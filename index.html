@@ -630,14 +630,20 @@ function pickAvatar(e){
 
 /* ---------------- SYNC (Google Sheets via Apps Script) ---------------- */
 let lastLocalWriteAt = 0;
+let sizeWarned = false;
 async function persist(){
   state.version++;
   lastLocalWriteAt = Date.now();
   if(!GAS_URL){ render(); return; } // mode démo local
+  const body = JSON.stringify(state);
+  if(body.length > 48000 && isAdmin && !sizeWarned){
+    sizeWarned = true;
+    alert("Attention : les données du tournoi approchent la limite de stockage du Google Sheet (" + body.length + " / 50 000 caractères). Réduis ou retire le logo du sponsor, sinon la sauvegarde risque d'échouer.");
+  }
   try{
     await fetch(GAS_URL, {
       method:"POST",
-      body: JSON.stringify(state),
+      body,
       headers:{ "Content-Type":"text/plain;charset=utf-8" }
     });
   }catch(e){ console.warn("Sync save error", e); }
@@ -771,34 +777,51 @@ function recordSignature(teamId){
 
 function generateSwissRound(roundNum){
   const t = state.tournament;
-  // group by wins (desc), ties broken randomly within group
-  let ids = t.teams.map(x=>x.id);
-  const groups = {};
-  ids.forEach(id=>{
-    const w = getTeam(id).wins;
-    groups[w] = groups[w] || [];
-    groups[w].push(id);
-  });
-  const winKeys = Object.keys(groups).map(Number).sort((a,b)=>b-a);
-  let leftover = [];
-  let allPairs = [];
-  winKeys.forEach(w=>{
-    let group = shuffle([...groups[w], ...leftover]);
-    leftover = [];
-    if(group.length % 2 !== 0){
-      leftover.push(group.pop()); // cascade to next group down
-    }
-    const pairs = pairAvoidingRematches(group, t.playedPairs, allPairs);
-    allPairs = allPairs.concat(pairs);
-  });
+  const played = new Set(t.playedPairs);
+
+  // Classement par nombre de victoires (égalités départagées au hasard)
+  let ids = shuffle(t.teams.map(x=>x.id));
+  ids.sort((a,b)=> getTeam(b).wins - getTeam(a).wins);
+
+  // Nombre impair : équipe secours, sinon exempt pour l'équipe la moins bien classée n'ayant pas déjà été exemptée
   let byeTeamId = null;
-  if(leftover.length){
+  if(ids.length % 2 !== 0){
     if(t.secoursEnabled && t.secours){
-      allPairs.push([leftover[0], "secours"]);
+      ids.push("secours");
     } else {
-      byeTeamId = leftover[0];
+      const hadBye = new Set();
+      t.rounds.forEach(r=>r.matches.forEach(m=>{ if(m.isBye) hadBye.add(m.a); }));
+      let idx = -1;
+      for(let i=ids.length-1;i>=0;i--){ if(!hadBye.has(ids[i])){ idx=i; break; } }
+      if(idx < 0) idx = ids.length-1;
+      byeTeamId = ids.splice(idx,1)[0];
     }
   }
+
+  // Appariement sans aucune revanche : chaque équipe affronte, parmi les adversaires
+  // qu'elle n'a jamais rencontrés, celui qui est le plus proche d'elle au classement.
+  // Si un groupe de victoires ne peut pas se démêler seul, on pioche chez les voisins.
+  let nodes = 0;
+  function solve(list){
+    if(!list.length) return [];
+    const a = list[0];
+    for(let j=1;j<list.length;j++){
+      const b = list[j];
+      if(played.has(pairKey(a,b))) continue;
+      if(++nodes > 200000) return null;
+      const rest = list.slice(1,j).concat(list.slice(j+1));
+      const sub = solve(rest);
+      if(sub) return [[a,b]].concat(sub);
+    }
+    return null;
+  }
+  let allPairs = solve(ids);
+  if(!allPairs){
+    // Cas quasi impossible (tournoi très long pour peu d'équipes) : on retombe sur
+    // l'ancienne méthode qui limite les revanches au strict minimum.
+    allPairs = pairAvoidingRematches(ids, t.playedPairs);
+  }
+
   const matches = allPairs.map(([a,b])=>({ id:uid(), a, b, scoreA:null, scoreB:null, played:false, isBye:false }));
   if(byeTeamId){
     matches.push({ id:uid(), a:byeTeamId, b:null, scoreA:null, scoreB:null, played:true, isBye:true });
@@ -988,7 +1011,33 @@ function handleSponsorLogoChange(input){
   const f = input.files[0];
   if(!f) return;
   const reader = new FileReader();
-  reader.onload = ()=>{ state.sponsor.logo = reader.result; persist(); input.value=""; };
+  reader.onload = ()=>{
+    // Le logo est réduit automatiquement : l'état du tournoi est stocké dans une cellule
+    // Google Sheets limitée à 50 000 caractères, un logo brut la ferait déborder.
+    const img = new Image();
+    img.onload = ()=>{
+      const MAX = 128;
+      const ratio = Math.min(1, MAX / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * ratio));
+      const h = Math.max(1, Math.round(img.height * ratio));
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      let out = "";
+      for(const q of [0.85, 0.7, 0.55, 0.4]){
+        out = canvas.toDataURL('image/jpeg', q);
+        if(out.length <= 12000) break;
+      }
+      state.sponsor.logo = out;
+      persist();
+      input.value = "";
+    };
+    img.onerror = ()=>{ alert("Image illisible, essaie un autre fichier (PNG ou JPG)."); input.value = ""; };
+    img.src = reader.result;
+  };
   reader.readAsDataURL(f);
 }
 function editClubName(){
